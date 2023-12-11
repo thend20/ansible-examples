@@ -1,0 +1,111 @@
+---
+# Before starting, we need local tokens used to generate tokens to be deployed:
+# - vault token create -orphan -policy=server_token -period 1800
+# - vault token create -orphan -policy=client_token -period 1800
+
+- hosts: CLIENT
+  gather_facts: false
+  serial: [1,5,10,25]
+
+  tasks:
+
+  - name: Set cert_type
+    set_fact:
+      cert_type: "client"
+    tags:
+      - gen_token
+      - cert_check
+      - gen_ca
+      - issue_cert
+
+  - name: Set ca_type
+    set_fact:
+      ca_type: "server"
+    tags:
+      - gen_token
+      - cert_check
+      - gen_ca
+      - issue_cert
+
+  - name: Create consul-template config dir
+    file:
+      dest: /etc/consul-template/templates
+      state: directory
+
+  - name: Create CA dir
+    file:
+      dest: /root/secrets/service_certs/pki-{{ ca_type }}-ca
+      state: directory
+
+  - name: Get pki CA (curl)
+    get_url:
+      url: https://vault.example.com:8200/v1/pki-ca/ca/pem
+      dest: /root/secrets/service_certs/pki-{{ ca_type }}-ca/pki-ca.pem
+    tags: gen_ca
+
+  - name: rehash CA dir
+    command: /usr/bin/c_rehash .
+    args:
+      chdir: /root/secrets/service_certs/pki-{{ ca_type }}-ca/  
+    tags: gen_ca
+
+  - name: Upload cert template
+    template:
+      src: pki.cert.j2
+      dest: /etc/consul-template/templates/pki.cert.tpl
+      variable_start_string: '<'
+      variable_end_string: '>'
+
+  - name: Upload key template         
+    template:
+      src: pki.key.j2
+      dest: /etc/consul-template/templates/pki.key.tpl
+      variable_start_string: '<'
+      variable_end_string: '>'
+
+  - name: Upload supervisor config (clients)
+    synchronize:
+      src: consul-template-pki.conf
+      dest: /etc/supervisor/conf.d/consul-template-pki.conf
+      use_ssh_args: true
+    register: svd_config
+    when: CLIENT is defined
+
+  - name: Upload supervisor config (clients)
+    synchronize:
+      src: vault-token-renew_pki.conf
+      dest: /etc/supervisor/conf.d/vault-token-renew_pki.conf
+      use_ssh_args: true
+    register: svd_config2
+    when: CLIENT is defined
+
+  - name: reread svd (clients)
+    command: supervisorctl update
+    when: svd_config.changed or svd_config2.changed
+
+  - name: Generate token (local)
+    local_action: command /root/vault/gen_token.pl -role pki-{{ cert_type }} -hostname {{inventory_hostname}} -token /root/secrets/vault/.pki.{{ cert_type }}.token
+    register: token
+    tags: [ gen_token, issue_cert ]
+
+  # Upload a token file to the clients
+  - name: Create token file
+    template:
+      src: TOKENFILE-pki-client.j2
+      dest: /root/secrets/vault/.pki-client
+    when: CLIENT is defined
+    tags: [ gen_token, issue_cert ]
+                                                                                                                                                            
+  # The token is included on clients
+  - name: Upload consul-template config
+    template:
+      src: pki.hcl.j2
+      dest: /etc/consul-template/pki.hcl
+    tags: issue_cert
+
+  # Clients run consul as a supervised service since certs are short lived
+  - name: Restart consul template service (clients)
+    command: supervisorctl restart consul-template-pki
+    when: CLIENT is defined
+    tags: issue_cert
+
